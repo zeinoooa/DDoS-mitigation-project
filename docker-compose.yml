@@ -1,0 +1,9 @@
+services:
+  ddos-mitigation:
+    build: .
+    ports:
+      - "8501:8501"
+    environment:
+      - PYTHONPATH=/app/src
+    cap_add:
+      - NET_ADMIN
