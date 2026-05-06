@@ -9,6 +9,7 @@
 ## 2. Baseline and Monitoring
 
 - File: `src/traffic.py`
+- Raw PCAP files are parsed directly from `data/pcap`.
 - The app aggregates every 5, 10, 15, or 30 seconds.
 - Metrics include packet rate, Mbps, protocol packet counts, SYN ratio, request rate, source concentration, port concentration, and unique source count.
 - The baseline is learned from benign windows when labels are present; otherwise it uses the first third of the dataset.
@@ -38,7 +39,7 @@
 
 - Files: `src/app.py`, `src/alerts.py`
 - Dashboard controls:
-  - Upload CSV or use bundled demo dataset.
+  - Select bundled PCAP files, upload PCAP files, or upload CSV files.
   - Move the time slider between normal and attack windows.
   - Adjust rolling window size, alert threshold, whitelist, and rate limits.
 - Alert channels:
@@ -50,10 +51,10 @@
 
 1. Run `docker compose up --build` or `streamlit run src/app.py`.
 2. Open `http://localhost:8501`.
-3. Show a normal window and explain why the score is low.
-4. Move to `09:06:00` for SYN flood detection.
-5. Move to `09:10:50` for HTTP flood detection.
-6. Move to `09:15:00` for UDP flood detection.
+3. Keep "Bundled PCAP files" selected.
+4. Select `normal.pcap`, `normal2.pcap`, and `mirai.pcap`.
+5. Show a normal window and explain why the score is low.
+6. Move into the Mirai attack windows and show the high anomaly score.
 7. Show indicator table, top sources, mitigation commands, and alert preview.
 
 ## 7. Expected TA Questions
@@ -62,4 +63,4 @@
 - How are false positives reduced? Multiple weighted indicators are combined instead of alerting on one metric.
 - Why not execute `iptables` automatically? The demo is safer and repeatable; production deployment can execute the generated commands with admin approval.
 - How are legitimate users protected? Whitelisting, gradual rate limits, max blocked source count, and token bucket shaping reduce overblocking.
-- Can it use CIC-DDoS2019? Yes. The uploader maps common CIC-style columns into the normalized schema.
+- Can it use PCAP files? Yes. The app parses classic Ethernet/IPv4 PCAP files and extracts source IP, destination IP, protocol, ports, bytes, SYN flags, and request-like counters.

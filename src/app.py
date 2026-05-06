@@ -8,13 +8,14 @@ import plotly.express as px
 import streamlit as st
 
 from alerts import Alert, dispatch_alert, format_alert_message
-from detection import build_baseline, detect_window, summarize_window
+from detection import build_baseline, detect_window, save_baseline, summarize_window
 from mitigation import MitigationPolicy, generate_mitigation_plan
-from traffic import aggregate_windows, load_or_create_demo_dataset, normalize_uploaded_dataset
+from traffic import available_pcap_files, aggregate_windows, load_pcap_dataset, normalize_uploaded_dataset, parse_pcap_file
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_PATH = BASE_DIR / "data" / "demo_traffic.csv"
+PCAP_DIR = BASE_DIR / "data" / "pcap"
+BASELINE_PATH = BASE_DIR / "data" / "baseline_metrics.json"
 
 
 st.set_page_config(
@@ -26,8 +27,18 @@ st.set_page_config(
 
 
 @st.cache_data(show_spinner=False)
-def load_demo() -> pd.DataFrame:
-    return load_or_create_demo_dataset(DATA_PATH)
+def load_pcaps(paths: tuple[str, ...], packet_limit_per_file: int) -> pd.DataFrame:
+    return load_pcap_dataset([Path(path) for path in paths], packet_limit_per_file=packet_limit_per_file)
+
+
+@st.cache_data(show_spinner=False)
+def load_uploaded_pcap(name: str, content: bytes) -> pd.DataFrame:
+    temp_path = BASE_DIR / "data" / "_uploaded_tmp.pcap"
+    temp_path.write_bytes(content)
+    try:
+        return parse_pcap_file(temp_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 @st.cache_data(show_spinner=False)
@@ -41,17 +52,37 @@ def metric_card(label: str, value: str, delta: str | None = None) -> None:
 
 def render_sidebar() -> tuple[pd.DataFrame, int, float, MitigationPolicy]:
     st.sidebar.header("Data Source")
-    uploaded = st.sidebar.file_uploader("Upload CIC-style or normalized CSV", type=["csv"])
-    if uploaded is None:
-        df = load_demo()
-        st.sidebar.caption("Using bundled deterministic demo traffic.")
+    source_type = st.sidebar.radio("Input type", ["Bundled PCAP files", "Upload PCAP", "Upload CSV"], index=0)
+    if source_type == "Bundled PCAP files":
+        pcap_files = available_pcap_files(PCAP_DIR)
+        if not pcap_files:
+            st.sidebar.error("No PCAP files found in data/pcap.")
+            return pd.DataFrame(), 10, 0.55, MitigationPolicy()
+        labels = [path.name for path in pcap_files]
+        default_names = [name for name in labels if name in {"normal.pcap", "normal2.pcap", "mirai.pcap"}]
+        selected_names = st.sidebar.multiselect("PCAP files", labels, default=default_names or labels[:2])
+        selected_paths = tuple(str(path) for path in pcap_files if path.name in selected_names)
+        packet_limit = st.sidebar.number_input("Packet limit per PCAP", 1_000, 500_000, 120_000, 5_000)
+        df = load_pcaps(selected_paths, int(packet_limit))
+        st.sidebar.caption("Using raw PCAP packets from data/pcap.")
+    elif source_type == "Upload PCAP":
+        uploaded = st.sidebar.file_uploader("Upload PCAP", type=["pcap", "cap"])
+        if uploaded is None:
+            st.sidebar.info("Upload a PCAP file to start.")
+            return pd.DataFrame(), 10, 0.55, MitigationPolicy()
+        df = load_uploaded_pcap(uploaded.name, uploaded.getvalue())
+        st.sidebar.caption("Using uploaded raw PCAP packets.")
     else:
+        uploaded = st.sidebar.file_uploader("Upload CIC-style or normalized CSV", type=["csv"])
+        if uploaded is None:
+            st.sidebar.info("Upload a CSV file to start.")
+            return pd.DataFrame(), 10, 0.55, MitigationPolicy()
         df = normalize_uploaded_dataset(pd.read_csv(uploaded))
-        st.sidebar.caption("Using uploaded traffic dataset.")
+        st.sidebar.caption("Using uploaded traffic CSV.")
 
     st.sidebar.header("Detection Settings")
     window_seconds = st.sidebar.select_slider("Rolling window", options=[5, 10, 15, 30], value=10)
-    alert_threshold = st.sidebar.slider("Alert threshold", 0.20, 1.00, 0.55, 0.05)
+    alert_threshold = st.sidebar.slider("Alert threshold", 0.20, 1.00, 0.45, 0.05)
 
     st.sidebar.header("Safeguards")
     whitelist_text = st.sidebar.text_area(
@@ -89,14 +120,19 @@ def render_notification_panel(alert: Alert | None) -> None:
 
 
 df, window_seconds, alert_threshold, policy = render_sidebar()
-windows = prepare_windows(df, window_seconds)
-baseline = build_baseline(windows)
-
 st.title("DDoS Mitigation Console")
 st.caption("Baseline modeling, rolling traffic analysis, anomaly scoring, mitigation planning, and alerting.")
 
+if df.empty:
+    st.error("No traffic data is loaded. Select PCAP files or upload a dataset from the sidebar.")
+    st.stop()
+
+windows = prepare_windows(df, window_seconds)
+baseline = build_baseline(windows)
+save_baseline(baseline, BASELINE_PATH)
+
 if windows.empty:
-    st.error("No traffic windows are available. Upload a CSV with packet or flow rows.")
+    st.error("No traffic windows are available. Select a PCAP with IPv4 packets or upload a supported dataset.")
     st.stop()
 
 selected_index = st.slider(

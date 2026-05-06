@@ -1,4 +1,3 @@
-# DDoS-mitigation-project
 # DDoS Mitigation Tool
 
 Streamlit dashboard for baseline traffic modeling, rolling anomaly detection, mitigation planning, and alert notifications.
@@ -39,20 +38,34 @@ The app displays recommended firewall commands by default. The dashboard does no
 
 ## Dataset
 
-The app creates `data/demo_traffic.csv` automatically if it is missing. The deterministic demo includes:
+The default data source is raw PCAP files in:
 
-- Normal traffic.
-- SYN flood from `09:06:00` to `09:08:00`.
-- HTTP application-layer flood from `09:10:50` to `09:12:40`.
-- UDP volumetric flood from `09:15:00` to `09:16:10`.
+```text
+data/pcap/
+```
 
-You can also upload a CSV. Native columns are:
+The dashboard includes a built-in classic PCAP parser for Ethernet/IPv4/TCP/UDP/ICMP packets, so it does not require `tshark` for the demo. By default, the sidebar selects benign captures and the Mirai capture:
+
+```text
+normal.pcap
+normal2.pcap
+mirai.pcap
+```
+
+Labels are inferred from filenames:
+
+- `normal.pcap` and `normal2.pcap` -> `BENIGN`
+- `mirai.pcap` -> `DDOS_MIRAI`
+- `replayAttacks.pcap` -> `DDOS_REPLAY`
+- other PCAP files -> `ATTACK`
+
+The app still supports uploading CSV files if needed. Native CSV columns are:
 
 ```text
 timestamp,src_ip,dst_ip,protocol,dst_port,packets,bytes,flow_duration_ms,syn_packets,requests,label
 ```
 
-The uploader also maps common CIC-style columns such as `Flow Duration`, `Total Fwd Packets`, `Destination Port`, `Protocol`, `SYN Flag Count`, and `Label`.
+The CSV uploader also maps common CIC-style columns such as `Flow Duration`, `Total Fwd Packets`, `Destination Port`, `Protocol`, `SYN Flag Count`, and `Label`.
 
 ## Alert Configuration
 
@@ -77,12 +90,13 @@ If these variables are not set, the dashboard still provides a console preview s
 ## Demo Script
 
 1. Start the container and open the dashboard.
-2. Keep the bundled demo dataset selected.
-3. Move the time slider through normal windows first and show the low anomaly score.
-4. Move to the SYN flood, HTTP flood, or UDP flood windows.
-5. Explain the indicator table, anomaly score, attack type, and source concentration table.
-6. Show generated `iptables` and token bucket recommendations.
-7. Use "Console preview" in Notifications and click "Send alert".
+2. Keep "Bundled PCAP files" selected.
+3. Use `normal.pcap`, `normal2.pcap`, and `mirai.pcap` for the main DDoS demo.
+4. Move the time slider through normal windows first and show the low anomaly score.
+5. Move into the Mirai attack windows and show the higher anomaly score.
+6. Explain the indicator table, anomaly score, attack type, and source concentration table.
+7. Show generated `iptables` and token bucket recommendations.
+8. Use "Console preview" in Notifications and click "Send alert".
 
 ## Team Subprojects
 

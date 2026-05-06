@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -89,6 +91,11 @@ def build_baseline(windows: pd.DataFrame) -> BaselineModel:
     return BaselineModel(stats)
 
 
+def save_baseline(baseline: BaselineModel, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(baseline.to_dict(), indent=2), encoding="utf-8")
+
+
 def infer_attack_type(window, indicators: list[IndicatorScore]) -> str:
     scores = {item.name: item.score for item in indicators}
     if scores.get("syn_ratio", 0) >= 0.35:
@@ -104,8 +111,9 @@ def infer_attack_type(window, indicators: list[IndicatorScore]) -> str:
 
 def detect_window(window, baseline: BaselineModel, alert_threshold: float = 0.55) -> DetectionResult:
     indicators = [baseline.score_feature(feature, float(window[feature])) for feature in FEATURES]
-    weighted_score = sum(item.score * WEIGHTS[item.name] for item in indicators)
-    score = min(weighted_score / sum(WEIGHTS.values()), 1.0)
+    weighted_score = sum(item.score * WEIGHTS[item.name] for item in indicators) / sum(WEIGHTS.values())
+    top_indicator_score = float(np.mean(sorted((item.score for item in indicators), reverse=True)[:2]))
+    score = min((0.45 * weighted_score) + (0.55 * top_indicator_score), 1.0)
     is_attack = score >= alert_threshold
     attack_type = infer_attack_type(window, indicators) if is_attack else "none"
     return DetectionResult(is_attack=is_attack, score=float(score), attack_type=attack_type, indicators=indicators)

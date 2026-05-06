@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ipaddress
+import struct
 from pathlib import Path
 
 import numpy as np
@@ -21,98 +23,155 @@ NORMALIZED_COLUMNS = {
 }
 
 
-def load_or_create_demo_dataset(path: Path) -> pd.DataFrame:
-    if path.exists():
-        return normalize_uploaded_dataset(pd.read_csv(path))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    df = generate_demo_traffic()
-    df.to_csv(path, index=False)
-    return df
+PCAP_LABELS = {
+    "normal": "BENIGN",
+    "normal2": "BENIGN",
+    "mirai": "DDOS_MIRAI",
+    "replayattacks": "DDOS_REPLAY",
+}
 
 
-def generate_demo_traffic(seed: int = 42) -> pd.DataFrame:
-    rng = np.random.default_rng(seed)
-    rows: list[dict[str, object]] = []
-    start = pd.Timestamp("2026-05-02 09:00:00")
-    customer_ips = [f"172.16.{i // 255}.{i % 255}" for i in range(1, 520)]
-    bot_ips = [f"198.51.100.{i}" for i in range(1, 80)] + [f"203.0.113.{i}" for i in range(1, 80)]
+def available_pcap_files(directory: Path) -> list[Path]:
+    return sorted(directory.glob("*.pcap"))
 
-    for second in range(0, 1080):
-        timestamp = start + pd.Timedelta(seconds=second)
-        attack = _attack_for_second(second)
-        if attack == "BENIGN":
-            flows = int(rng.poisson(18))
-        elif attack == "SYN_FLOOD":
-            flows = int(rng.poisson(95))
-        elif attack == "HTTP_FLOOD":
-            flows = int(rng.poisson(80))
-        else:
-            flows = int(rng.poisson(110))
 
-        for _ in range(max(flows, 1)):
-            row = _make_flow(rng, timestamp, attack, customer_ips, bot_ips)
-            rows.append(row)
+def load_pcap_dataset(paths: list[Path], packet_limit_per_file: int = 120_000) -> pd.DataFrame:
+    frames = []
+    offset_seconds = 0.0
+    for path in paths:
+        parsed = parse_pcap_file(path, packet_limit=packet_limit_per_file)
+        if parsed.empty:
+            continue
+        parsed = parsed.sort_values("timestamp")
+        first_ts = parsed["timestamp"].min()
+        parsed["timestamp"] = (
+            pd.Timestamp("2026-05-02 09:00:00")
+            + pd.to_timedelta(offset_seconds, unit="s")
+            + (parsed["timestamp"] - first_ts)
+        )
+        offset_seconds += max((parsed["timestamp"].max() - parsed["timestamp"].min()).total_seconds(), 60.0) + 30.0
+        frames.append(parsed)
+
+    if not frames:
+        return pd.DataFrame(columns=sorted(NORMALIZED_COLUMNS))
+    return normalize_uploaded_dataset(pd.concat(frames, ignore_index=True))
+
+
+def parse_pcap_file(path: Path, packet_limit: int = 120_000) -> pd.DataFrame:
+    label = label_for_pcap(path)
+    rows = []
+    with path.open("rb") as handle:
+        header = handle.read(24)
+        if len(header) < 24:
+            return pd.DataFrame(columns=sorted(NORMALIZED_COLUMNS))
+        endian, ts_scale = _pcap_format(header[:4])
+        if endian is None:
+            raise ValueError(f"{path.name} is not a classic PCAP file.")
+        linktype = struct.unpack(f"{endian}HHIIII", header[4:24])[-1]
+
+        count = 0
+        while count < packet_limit:
+            packet_header = handle.read(16)
+            if len(packet_header) < 16:
+                break
+            ts_sec, ts_frac, included_len, _original_len = struct.unpack(f"{endian}IIII", packet_header)
+            packet = handle.read(included_len)
+            if len(packet) < included_len:
+                break
+            parsed = _parse_packet(packet, linktype)
+            if parsed is None:
+                continue
+            timestamp = pd.Timestamp.fromtimestamp(ts_sec + (ts_frac / ts_scale))
+            parsed.update(
+                {
+                    "timestamp": timestamp,
+                    "packets": 1,
+                    "bytes": included_len,
+                    "flow_duration_ms": 1,
+                    "label": label,
+                    "source_file": path.name,
+                }
+            )
+            rows.append(parsed)
+            count += 1
+
     return pd.DataFrame(rows)
 
 
-def _attack_for_second(second: int) -> str:
-    if 360 <= second < 480:
-        return "SYN_FLOOD"
-    if 650 <= second < 760:
-        return "HTTP_FLOOD"
-    if 900 <= second < 970:
-        return "UDP_FLOOD"
-    return "BENIGN"
+def label_for_pcap(path: Path) -> str:
+    stem = path.stem.lower()
+    return PCAP_LABELS.get(stem, "ATTACK")
 
 
-def _make_flow(rng, timestamp, attack: str, customer_ips: list[str], bot_ips: list[str]) -> dict[str, object]:
-    dst_ip = "10.0.0.10"
-    if attack == "BENIGN":
-        src_ip = rng.choice(customer_ips)
-        protocol = rng.choice(["TCP", "UDP", "ICMP"], p=[0.82, 0.14, 0.04])
-        dst_port = int(rng.choice([80, 443, 22, 53, 8080], p=[0.32, 0.46, 0.05, 0.10, 0.07]))
-        packets = int(max(1, rng.poisson(8)))
-        byte_count = int(packets * rng.integers(500, 1300))
-        syn_packets = int(rng.binomial(packets, 0.08 if protocol == "TCP" else 0.0))
-        requests = int(rng.poisson(2 if dst_port in {80, 443, 8080} else 0.2))
-    elif attack == "SYN_FLOOD":
-        src_ip = rng.choice(bot_ips[:75])
-        protocol = "TCP"
-        dst_port = 80
-        packets = int(max(1, rng.poisson(24)))
-        byte_count = int(packets * rng.integers(60, 120))
-        syn_packets = int(max(1, packets * rng.uniform(0.78, 0.98)))
-        requests = int(rng.poisson(1))
-    elif attack == "HTTP_FLOOD":
-        hot_bots = bot_ips[75:120]
-        src_ip = rng.choice(hot_bots)
-        protocol = "TCP"
-        dst_port = int(rng.choice([80, 443], p=[0.65, 0.35]))
-        packets = int(max(1, rng.poisson(14)))
-        byte_count = int(packets * rng.integers(600, 1400))
-        syn_packets = int(rng.binomial(packets, 0.04))
-        requests = int(max(1, rng.poisson(20)))
+def _pcap_format(magic: bytes) -> tuple[str | None, float]:
+    formats = {
+        b"\xd4\xc3\xb2\xa1": ("<", 1_000_000.0),
+        b"\xa1\xb2\xc3\xd4": (">", 1_000_000.0),
+        b"\x4d\x3c\xb2\xa1": ("<", 1_000_000_000.0),
+        b"\xa1\xb2\x3c\x4d": (">", 1_000_000_000.0),
+    }
+    return formats.get(magic, (None, 1_000_000.0))
+
+
+def _parse_packet(packet: bytes, linktype: int) -> dict[str, object] | None:
+    if linktype == 1:
+        if len(packet) < 14:
+            return None
+        ethertype = int.from_bytes(packet[12:14], "big")
+        offset = 14
+        if ethertype == 0x8100 and len(packet) >= 18:
+            ethertype = int.from_bytes(packet[16:18], "big")
+            offset = 18
+    elif linktype == 113:
+        if len(packet) < 16:
+            return None
+        ethertype = int.from_bytes(packet[14:16], "big")
+        offset = 16
     else:
-        src_ip = rng.choice(bot_ips)
+        return None
+
+    if ethertype != 0x0800:
+        return None
+    return _parse_ipv4(packet[offset:])
+
+
+def _parse_ipv4(payload: bytes) -> dict[str, object] | None:
+    if len(payload) < 20:
+        return None
+    version = payload[0] >> 4
+    ihl = (payload[0] & 0x0F) * 4
+    if version != 4 or len(payload) < ihl:
+        return None
+    protocol_number = payload[9]
+    src_ip = str(ipaddress.IPv4Address(payload[12:16]))
+    dst_ip = str(ipaddress.IPv4Address(payload[16:20]))
+    transport = payload[ihl:]
+
+    dst_port = 0
+    syn_packets = 0
+    requests = 0
+    if protocol_number == 6 and len(transport) >= 20:
+        protocol = "TCP"
+        dst_port = int.from_bytes(transport[2:4], "big")
+        flags = transport[13]
+        syn_packets = 1 if flags & 0x02 and not flags & 0x10 else 0
+        requests = 1 if dst_port in {80, 443, 8080} else 0
+    elif protocol_number == 17 and len(transport) >= 8:
         protocol = "UDP"
-        dst_port = int(rng.choice([53, 123, 1900]))
-        packets = int(max(1, rng.poisson(45)))
-        byte_count = int(packets * rng.integers(900, 1500))
-        syn_packets = 0
-        requests = int(rng.poisson(0.5))
+        dst_port = int.from_bytes(transport[2:4], "big")
+        requests = 1 if dst_port in {53, 123, 1900} else 0
+    elif protocol_number == 1:
+        protocol = "ICMP"
+    else:
+        protocol = f"IP-{protocol_number}"
 
     return {
-        "timestamp": timestamp,
         "src_ip": src_ip,
         "dst_ip": dst_ip,
         "protocol": protocol,
         "dst_port": dst_port,
-        "packets": packets,
-        "bytes": byte_count,
-        "flow_duration_ms": int(rng.integers(20, 2000)),
         "syn_packets": syn_packets,
         "requests": requests,
-        "label": attack,
     }
 
 
