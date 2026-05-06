@@ -5,5 +5,11 @@ services:
       - "8501:8501"
     environment:
       - PYTHONPATH=/app/src
+      - SMTP_HOST=smtp.gmail.com
+      - SMTP_PORT=587
+      - SMTP_USER=jzein610@gmail.com
+      - SMTP_PASSWORD=yzlx scvn fakh jtez
+      - SMTP_FROM=jzein610@gmail.com
+      - SLACK_WEBHOOK_URL=
     cap_add:
       - NET_ADMIN

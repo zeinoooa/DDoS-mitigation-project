@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable
 
 
 @dataclass(frozen=True)
 class MitigationPolicy:
     whitelist: tuple[str, ...] = ("10.0.0.1", "10.0.0.2", "127.0.0.1")
+    blacklist: tuple[str, ...] = ()          # NEW: always-drop IPs
     soft_packet_limit: int = 600
     hard_packet_limit: int = 1200
     max_blocked_sources: int = 5
@@ -28,7 +29,11 @@ class MitigationPlan:
 
 
 class TokenBucket:
-    """Token bucket used by the demo API and to explain rate-limit behavior."""
+    """Token bucket algorithm for rate limiting.
+
+    Tokens refill at fill_rate per second up to capacity.
+    consume() returns True (allowed) or False (rate-limited).
+    """
 
     def __init__(self, capacity: int, fill_rate: float) -> None:
         self.capacity = capacity
@@ -49,6 +54,10 @@ class TokenBucket:
 
 def is_whitelisted(ip: str, whitelist: Iterable[str]) -> bool:
     return ip in set(whitelist)
+
+
+def is_blacklisted(ip: str, blacklist: Iterable[str]) -> bool:
+    return ip in set(blacklist)
 
 
 def hashlimit_rule(ip: str, packets_per_second: int) -> str:
@@ -78,18 +87,41 @@ def syn_limit_rule(limit_per_second: int) -> str:
 
 
 def generate_mitigation_plan(window, detection_result, policy: MitigationPolicy) -> MitigationPlan:
+    actions: list[MitigationAction] = []
+
+    # ── Always drop blacklisted IPs regardless of detection result ───────────
+    for ip in policy.blacklist:
+        actions.append(MitigationAction(
+            title="Blacklist drop",
+            command=drop_rule(ip),
+            reason=f"IP {ip} is on the permanent blacklist and is always dropped.",
+        ))
+
     if not detection_result.is_attack:
-        return MitigationPlan(restriction_level="none", blocked_sources=[], actions=[])
+        return MitigationPlan(
+            restriction_level="none" if not policy.blacklist else "blacklist active",
+            blocked_sources=[],
+            actions=actions,
+        )
 
     top_sources = window.get("top_sources", [])
     suspicious_sources: list[str] = []
     for row in top_sources if isinstance(top_sources, list) else []:
         ip = row.get("src_ip")
-        if ip and not is_whitelisted(ip, policy.whitelist):
-            suspicious_sources.append(ip)
+        if not ip:
+            continue
+        if is_whitelisted(ip, policy.whitelist):
+            continue        # never block whitelisted IPs
+        if is_blacklisted(ip, policy.blacklist):
+            continue        # already handled above
+        suspicious_sources.append(ip)
         if len(suspicious_sources) >= policy.max_blocked_sources:
             break
 
+    # ── Gradual / safeguarded mitigation (C.5) ───────────────────────────────
+    # Level 1 (score < 0.65): watch + lenient rate limit
+    # Level 2 (0.65 – 0.85): strict rate limit
+    # Level 3 (>= 0.85):     hard block (DROP)
     if detection_result.score >= 0.85:
         restriction = "hard block"
         per_source_limit = policy.hard_packet_limit
@@ -100,34 +132,42 @@ def generate_mitigation_plan(window, detection_result, policy: MitigationPolicy)
         restriction = "watch and lenient rate limit"
         per_source_limit = max(policy.soft_packet_limit * 2, policy.hard_packet_limit)
 
-    actions: list[MitigationAction] = []
+    # SYN flood global guard
     if detection_result.attack_type == "SYN flood":
-        actions.append(
-            MitigationAction(
-                title="Global SYN guard",
-                command=syn_limit_rule(limit_per_second=per_source_limit),
-                reason="SYN packet share is above the learned baseline.",
-            )
-        )
+        actions.append(MitigationAction(
+            title="Global SYN guard",
+            command=syn_limit_rule(limit_per_second=per_source_limit),
+            reason="SYN packet share exceeded the learned baseline — applying global SYN rate guard.",
+        ))
 
+    # Per-source actions
     for ip in suspicious_sources:
         if restriction == "hard block":
-            command = drop_rule(ip)
-            title = "Block attacking source"
-            reason = "High anomaly score and concentrated traffic from this source."
+            actions.append(MitigationAction(
+                title="Block attacking source",
+                command=drop_rule(ip),
+                reason=f"Score {detection_result.score:.2f} >= 0.85 — high-confidence attack from {ip}.",
+            ))
         else:
-            command = hashlimit_rule(ip, packets_per_second=per_source_limit)
-            title = "Rate limit suspicious source"
-            reason = "Gradual mitigation keeps legitimate traffic available while reducing attack impact."
-        actions.append(MitigationAction(title=title, command=command, reason=reason))
+            actions.append(MitigationAction(
+                title="Rate limit suspicious source",
+                command=hashlimit_rule(ip, packets_per_second=per_source_limit),
+                reason=(
+                    f"Score {detection_result.score:.2f} — gradual mitigation applied. "
+                    "Lenient first to avoid blocking legitimate traffic."
+                ),
+            ))
 
-    if not actions:
-        actions.append(
-            MitigationAction(
-                title="Service-level token bucket",
-                command=f"TokenBucket(capacity={per_source_limit}, fill_rate={per_source_limit / 2:.1f})",
-                reason="No non-whitelisted dominant source was found, so apply service-level shaping.",
-            )
-        )
+    # Fallback: service-level token bucket when no dominant source found
+    if not suspicious_sources and not any(a.title == "Global SYN guard" for a in actions):
+        actions.append(MitigationAction(
+            title="Service-level token bucket",
+            command=f"TokenBucket(capacity={per_source_limit}, fill_rate={per_source_limit / 2:.1f})",
+            reason="No non-whitelisted dominant source found — applying service-level token-bucket shaping.",
+        ))
 
-    return MitigationPlan(restriction_level=restriction, blocked_sources=suspicious_sources, actions=actions)
+    return MitigationPlan(
+        restriction_level=restriction,
+        blocked_sources=suspicious_sources,
+        actions=actions,
+    )
